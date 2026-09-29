@@ -1,0 +1,29 @@
+{
+  "name": "coupon-redemption-service",
+  "version": "1.0.0",
+  "description": "High-concurrency coupon redemption service with strict transactional consistency",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "migrate": "node scripts/migrate.js",
+    "test:phase1": "node test/phase1.test.js",
+    "test:phase2": "node test/phase2.test.js"
+  },
+  "keywords": [
+    "coupon",
+    "redemption",
+    "concurrency",
+    "mysql",
+    "express"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-validator": "^7.2.1",
+    "mysql2": "^3.12.0"
+  },
+  "devDependencies": {}
+}

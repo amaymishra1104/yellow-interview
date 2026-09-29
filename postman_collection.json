@@ -1,0 +1,157 @@
+{
+  "info": {
+    "_postman_id": "c71a39f6-281b-4d4b-9706-5b721867e2a9",
+    "name": "Coupon Redemption Service API",
+    "description": "Postman Collection for testing all endpoints, validations, transactional redemptions, idempotency, and order cancellations.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3000",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Healthcheck",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/health",
+          "host": ["{{baseUrl}}"],
+          "path": ["health"]
+        }
+      }
+    },
+    {
+      "name": "2. Create Coupon (STANDARD)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"code\": \"WELCOME20\",\n  \"max_redemptions\": 10,\n  \"discount_percent\": 20,\n  \"expires_at\": \"2026-12-31T23:59:59.000Z\",\n  \"type\": \"STANDARD\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/coupons",
+          "host": ["{{baseUrl}}"],
+          "path": ["coupons"]
+        }
+      }
+    },
+    {
+      "name": "3. Create Coupon (STACKABLE / Referral)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"code\": \"REF_VIP\",\n  \"max_redemptions\": 100,\n  \"discount_percent\": 15,\n  \"expires_at\": \"2026-12-31T23:59:59.000Z\",\n  \"type\": \"STACKABLE\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/coupons",
+          "host": ["{{baseUrl}}"],
+          "path": ["coupons"]
+        }
+      }
+    },
+    {
+      "name": "4. Get Coupon Status (Direct & Consistent)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/coupons/WELCOME20",
+          "host": ["{{baseUrl}}"],
+          "path": ["coupons", "WELCOME20"]
+        }
+      }
+    },
+    {
+      "name": "5. Redeem Coupon (POST /redeem)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Idempotency-Key",
+            "value": "idem-key-user1-order1"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"code\": \"WELCOME20\",\n  \"customer_id\": \"cust_101\",\n  \"order_id\": \"ord_5001\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/redeem",
+          "host": ["{{baseUrl}}"],
+          "path": ["redeem"]
+        }
+      }
+    },
+    {
+      "name": "6. Test Idempotency Replay (Same Key & Body)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Idempotency-Key",
+            "value": "idem-key-user1-order1"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"code\": \"WELCOME20\",\n  \"customer_id\": \"cust_101\",\n  \"order_id\": \"ord_5001\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/redeem",
+          "host": ["{{baseUrl}}"],
+          "path": ["redeem"]
+        }
+      }
+    },
+    {
+      "name": "7. Cancel Order & Return Slot (POST /orders/:order_id/cancel)",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/orders/ord_5001/cancel",
+          "host": ["{{baseUrl}}"],
+          "path": ["orders", "ord_5001", "cancel"]
+        }
+      }
+    },
+    {
+      "name": "8. Duplicate Cancel (No-Op Idempotency Test)",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/orders/ord_5001/cancel",
+          "host": ["{{baseUrl}}"],
+          "path": ["orders", "ord_5001", "cancel"]
+        }
+      }
+    }
+  ]
+}
