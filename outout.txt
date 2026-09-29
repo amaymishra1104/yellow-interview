@@ -1,0 +1,92 @@
+ npm run test:concurrency
+
+> coupon-redemption-service@1.0.0 test:concurrency
+> node test/concurrency.test.js
+
+================================================================
+🚀 MULTI-INSTANCE DISTRIBUTED CONCURRENCY TEST SUITE
+🎯 Targets: Instance 1 (http://127.0.0.1:3001) & Instance 2 (http://127.0.0.1:3002)
+================================================================
+
+⏳ Waiting for both app instances (port 3001 & port 3002) to be ready...
+✓ Both instances are healthy and connected to MySQL (Attempt 1)
+
+----------------------------------------------------------------
+TEST 1: Distributed Flash-Sale Burst Test
+Scenario: 50 concurrent requests against a coupon with max_redemptions = 10
+Requests interleaved evenly across Instance 1 (port 3001) and Instance 2 (port 3002)
+----------------------------------------------------------------
+✓ Seeded coupon 'FLASH_50_1790673679597' (max_redemptions: 10)
+⚡ Dispatching 50 simultaneous requests across both nodes...
+📊 Burst Results:
+   - Total requests:              50
+   - Successful (200 OK):         10 (Expected: 10)
+   - Quota Exhausted (409):       40 (Expected: 40)
+   - Unexpected Errors:           0
+✓ Real-time status from Instance 1: { redeemed_count: 10, remaining: 0, max_redemptions: 10 }
+✓ Real-time status from Instance 2: { redeemed_count: 10, remaining: 0, max_redemptions: 10 }
+✅ TEST 1 PASSED: Strict zero over-redemption under distributed burst!
+
+----------------------------------------------------------------
+TEST 2: Distributed Idempotency Replay
+Scenario: Two concurrent requests with the identical Idempotency-Key
+sent at the same instant to App1 and App2
+----------------------------------------------------------------
+✓ Initial request to App1 response: { success: true, remaining: 4, redeemed_count: 1 }
+✓ Retry request to App2 response: {
+  success: true,
+  remaining: 4,
+  redeemed_count: 1,
+  idempotency_replay: true
+}
+✓ Header X-Idempotency-Replay: true
+✅ TEST 2 PASSED: Distributed idempotency prevented double-redeeming!
+
+----------------------------------------------------------------
+TEST 3: Distributed Concurrent Order Cancellation
+Scenario: Calling cancel simultaneously on App1 and App2 for the same order
+----------------------------------------------------------------
+Cancelling order 'ord_retry_1790673679597' simultaneously on App1 and App2...       
+Cancellation Response 1 (App1): {
+  status: 200,
+  body: {
+    success: true,
+    message: 'Order redemption cancelled successfully and slot returned',
+    slot_returned: true,
+    remaining: 5,
+    redeemed_count: 0
+  }
+}
+Cancellation Response 2 (App2): {
+  status: 200,
+  body: {
+    success: true,
+    message: 'Order redemption was already cancelled',
+    slot_returned: false,
+    already_cancelled: true
+  }
+}
+Coupon state after concurrent cancellations: { redeemed_count: 0, remaining: 5, max_redemptions: 5 }
+✅ TEST 3 PASSED: Concurrent duplicate cancellation returned slot exactly once!     
+
+----------------------------------------------------------------
+TEST 4: Distributed Customer Collision (STANDARD Coupon)
+Scenario: Same customer sends simultaneous redemptions to App1 and App2
+----------------------------------------------------------------
+Response 1 from App1: {
+  status: 409,
+  body: {
+    success: false,
+    error: 'ALREADY_REDEEMED_BY_CUSTOMER',
+    message: 'STANDARD coupon has already been redeemed by this customer'
+  }
+}
+Response 2 from App2: {
+  status: 200,
+  body: { success: true, remaining: 9, redeemed_count: 1 }
+}
+✅ TEST 4 PASSED: Distributed customer limit strictly enforced!
+
+================================================================
+🎉 ALL DISTRIBUTED CONCURRENCY & MULTI-PROCESS TESTS PASSED! 🎉
+================================================================
