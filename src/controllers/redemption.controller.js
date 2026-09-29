@@ -92,7 +92,7 @@ class RedemptionController {
           error: 'UNKNOWN_COUPON',
           message: `Coupon with code '${code}' does not exist`
         };
-        await IdempotencyModel.completeKey(idempotencyKey, 404, errPayload);
+        await IdempotencyModel.completeKey(idempotencyKey, 404, errPayload, connection);
         return res.status(404).json(errPayload);
       }
 
@@ -106,7 +106,7 @@ class RedemptionController {
           error: 'COUPON_EXPIRED',
           message: 'Coupon has expired'
         };
-        await IdempotencyModel.completeKey(idempotencyKey, 410, errPayload);
+        await IdempotencyModel.completeKey(idempotencyKey, 410, errPayload, connection);
         return res.status(410).json(errPayload);
       }
 
@@ -118,13 +118,13 @@ class RedemptionController {
           error: 'MAX_REDEMPTIONS_REACHED',
           message: 'No redemptions left for this coupon'
         };
-        await IdempotencyModel.completeKey(idempotencyKey, 409, errPayload);
+        await IdempotencyModel.completeKey(idempotencyKey, 409, errPayload, connection);
         return res.status(409).json(errPayload);
       }
 
       // Failure Mode 4: Order ID Already Redeemed
       const [existingOrder] = await connection.query(
-        'SELECT id, status FROM redemptions WHERE order_id = ? FOR UPDATE;',
+        'SELECT id, status FROM redemptions WHERE order_id = ?;',
         [order_id.trim()]
       );
       if (existingOrder && existingOrder.length > 0 && existingOrder[0].status === 'ACTIVE') {
@@ -134,7 +134,7 @@ class RedemptionController {
           error: 'ORDER_ALREADY_REDEEMED',
           message: `Order '${order_id}' has already redeemed a coupon`
         };
-        await IdempotencyModel.completeKey(idempotencyKey, 409, errPayload);
+        await IdempotencyModel.completeKey(idempotencyKey, 409, errPayload, connection);
         return res.status(409).json(errPayload);
       }
 
@@ -151,7 +151,7 @@ class RedemptionController {
             error: 'ALREADY_REDEEMED_BY_CUSTOMER',
             message: 'STANDARD coupon has already been redeemed by this customer'
           };
-          await IdempotencyModel.completeKey(idempotencyKey, 409, errPayload);
+          await IdempotencyModel.completeKey(idempotencyKey, 409, errPayload, connection);
           return res.status(409).json(errPayload);
         }
       }
@@ -169,9 +169,6 @@ class RedemptionController {
         [coupon.id, customer_id.trim(), order_id.trim()]
       );
 
-      // Commit the transaction
-      await connection.commit();
-
       const newRedeemedCount = Number(coupon.redeemed_count) + 1;
       const remainingSlots = Math.max(0, Number(coupon.max_redemptions) - newRedeemedCount);
 
@@ -181,8 +178,11 @@ class RedemptionController {
         redeemed_count: newRedeemedCount
       };
 
-      // 3. Mark idempotency record as COMPLETED
-      await IdempotencyModel.completeKey(idempotencyKey, 200, successPayload);
+      // 3. Mark idempotency record as COMPLETED atomically within transaction
+      await IdempotencyModel.completeKey(idempotencyKey, 200, successPayload, connection);
+
+      // Commit the transaction
+      await connection.commit();
 
       return res.status(200).json(successPayload);
     } catch (err) {
@@ -190,7 +190,11 @@ class RedemptionController {
         await connection.rollback();
       }
       // On unhandled server error, release idempotency key so client can retry
-      await IdempotencyModel.removeKey(idempotencyKey);
+      try {
+        await IdempotencyModel.removeKey(idempotencyKey, connection);
+      } catch {
+        // ignore cleanup error
+      }
       next(err);
     } finally {
       if (connection) {

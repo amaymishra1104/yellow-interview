@@ -39,8 +39,8 @@ class IdempotencyModel {
   /**
    * Mark the idempotency record as COMPLETED with the given response payload
    */
-  static async completeKey(key, responseStatus, responseBody) {
-    const db = getPool();
+  static async completeKey(key, responseStatus, responseBody, client = null) {
+    const db = client || getPool();
     const query = `
       UPDATE idempotency_records
       SET status = 'COMPLETED',
@@ -54,8 +54,8 @@ class IdempotencyModel {
   /**
    * Remove key on unhandled transient system error to allow retry
    */
-  static async removeKey(key) {
-    const db = getPool();
+  static async removeKey(key, client = null) {
+    const db = client || getPool();
     const query = `
       DELETE FROM idempotency_records
       WHERE idempotency_key = ?;

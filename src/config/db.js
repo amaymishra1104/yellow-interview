@@ -14,7 +14,7 @@ function getPool() {
       password: process.env.DB_PASSWORD || 'rootpassword',
       database: process.env.DB_NAME || 'coupon_db',
       waitForConnections: true,
-      connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '20', 10),
+      connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '50', 10),
       queueLimit: 0,
       multipleStatements: true,
       timezone: 'Z', // UTC handling
