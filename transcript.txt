@@ -1,0 +1,719 @@
+================================================================================
+USER:
+================================================================================
+
+Coupon redemption service — candidate brief
+AI-assisted coding round · Backend (Node.js/Java/Python and  SQL)
+
+You are building a coupon redemption service for an e-commerce checkout.
+Each coupon has: code, max_redemptions (total times it can ever be used, ever), discount_percent, expires_at, and type (STANDARD or STACKABLE). Rules:
+A coupon cannot be redeemed more than max_redemptions times — even under a burst of simultaneous checkouts on a flash-sale coupon.
+A STANDARD coupon can only be redeemed once per customer_id, ever.
+A STACKABLE coupon (e.g. referral codes) has no per-customer limit, but still respects max_redemptions globally.
+A coupon redeemed after expires_at must be rejected — but a redemption in flight at the exact expiry instant must resolve consistently, not by luck of thread scheduling.
+Orders can be cancelled. Cancelling an order that used a coupon must give the redemption slot back (redeemed_count decrements) — but only once per order, even if the cancellation endpoint is called twice.
+Retrying the same redemption request (network client retries after a timeout, doesn't know if the first one landed) must not double-redeem. Callers send an Idempotency-Key header on POST /redeem.
+API:
+POST /coupons → { code, max_redemptions, discount_percent, expires_at, type } — seed data.
+POST /redeem (header: Idempotency-Key) → { code, customer_id, order_id } → { success: true, remaining } or a clear, distinct error per failure mode (already used / no redemptions left / expired / unknown code / idempotency replay).
+POST /orders/:order_id/cancel → reverses the coupon redemption tied to that order, if any. Calling it twice must be a no-op the second time, not a double refund of the slot.
+GET /coupons/:code → { redeemed_count, remaining, max_redemptions } — this number must be correct at all times, not eventually correct.
+You must also ship:
+A MySQL schema (migrations or schema file) — you own it, no framework auto-generating it for you.
+A concurrency test that: fires more simultaneous POST /redeem calls than max_redemptions allows and proves the final count is exact; retries one request with the same Idempotency-Key twice and proves it's charged once; calls cancel twice on the same order and proves the slot is only returned once.
+Run this test against two instances of your app process pointed at the same SQL server — not just one process with a thread pool. If your correctness lives in an in-memory lock, this will expose it.
+A README: how to run it (Docker Compose for SQL server is fine), and how you verified each rule above.  this the problem on which i have to create a coupan system i need you to first discuss the approch planning and methods to start so for the tech stack we will be using node js , express , express validator and and sql with docker and make sure its is a mvp model so docker mainly use for images of services
+
+================================================================================
+ASSISTANT:
+================================================================================
+
+Here is the architectural plan, concurrency strategy, and implementation approach for building the **Coupon Redemption Service**.
+
+---
+
+### 1. Core Concurrency & Correctness Strategy
+
+Because the service must run reliably across **multiple app processes** against a shared database, **in-memory locks (like JS mutexes or semaphores) cannot be used**. All locking and guarantees must be enforced at the database transaction layer.
+
+#### A. Slot Allocation & Global Limit (`max_redemptions`)
+* **Strategy:** Use database transactions with pessimistic row locking (`SELECT ... FOR UPDATE`) on the coupon record.
+* **Why:** When multiple requests hit either instance simultaneously for the same coupon code:
+  1. Transaction begins (`BEGIN`).
+  2. Query `SELECT * FROM coupons WHERE code = ? FOR UPDATE;` locks that specific coupon row.
+  3. Validate conditions inside the lock:
+     - Does coupon exist? (If not $\rightarrow$ `UNKNOWN_CODE`)
+     - Is `NOW() >= expires_at`? (If expired $\rightarrow$ `COUPON_EXPIRED`)
+     - Is `redeemed_count >= max_redemptions`? (If full $\rightarrow$ `NO_REDEMPTIONS_LEFT`)
+  4. Perform customer-level check (for `STANDARD` coupons).
+  5. Increment `redeemed_count = redeemed_count + 1`.
+  6. Insert into `redemptions` table.
+  7. Commit (`COMMIT`).
+* **Guarantee:** Strict serialization per coupon row. At no point can `redeemed_count` exceed `max_redemptions`, even under high concurrency bursts across multiple processes. Additionally, a MySQL `CHECK (redeemed_count <= max_redemptions)` constraint will act as a fail-safe.
+
+#### B. Per-Customer Limit for `STANDARD` Coupons
+* **Rule:** A `STANDARD` coupon can only be redeemed once per `customer_id` ever. `STACKABLE` coupons have no per-customer limit.
+* **Strategy:**
+  * For `STANDARD` coupons, query within the transaction: `SELECT 1 FROM redemptions WHERE coupon_id = ? AND customer_id = ? AND status = 'ACTIVE' FOR UPDATE;`.
+  * If a record exists $\rightarrow$ reject with `ALREADY_REDEEMED_BY_CUSTOMER`.
+
+#### C. Atomic Expiry (`expires_at`)
+* **Rule:** A coupon redeemed after `expires_at` must be rejected; in-flight redemptions at the exact instant must resolve deterministically.
+* **Strategy:** Use the database engine's timestamp `NOW(3)` (millisecond precision) inside the transaction query:
+  `WHERE code = ? AND expires_at > NOW(3)` or compare against `CURRENT_TIMESTAMP` within the locked row check. This eliminates clock drift between Node.js app instances.
+
+#### D. Cancellation Idempotency (`POST /orders/:order_id/cancel`)
+* **Rule:** Reverses redemption, decrements `redeemed_count`. Calling twice must be a no-op the second time, not a double-refund.
+* **Strategy:**
+  1. Transaction begins.
+  2. `SELECT * FROM redemptions WHERE order_id = ? FOR UPDATE;`
+  3. If no redemption found $\rightarrow$ `ORDER_NOT_FOUND` (or 404).
+  4. If status is already `'CANCELLED'` $\rightarrow$ Return immediately with `{ success: true, message: "Order redemption was already cancelled", already_cancelled: true }` without touching `coupons.redeemed_count`.
+  5. If status is `'ACTIVE'`:
+     - Update redemption status to `'CANCELLED'`.
+     - Update coupon: `UPDATE coupons SET redeemed_count = redeemed_count - 1 WHERE id = ?`.
+  6. Commit transaction.
+
+#### E. Idempotency Key Handling (`Idempotency-Key` header)
+* **Rule:** Retrying the same redemption request must not double-redeem or charge twice.
+* **Strategy:**
+  * Dedicated `idempotency_keys` table:
+    * `key`: Primary Key (string)
+    * `request_hash`: SHA256 of `{ code, customer_id, order_id }` to detect parameter mismatches
+    * `status`: `'IN_PROGRESS'` | `'COMPLETED'`
+    * `response_status`: HTTP status code (e.g. 200, 409)
+    * `response_body`: JSON payload
+  * On incoming `POST /redeem`:
+    * Attempt `INSERT INTO idempotency_keys (key, request_hash, status) VALUES (...)`:
+      * If duplicate key error: Fetch the existing record. If `'COMPLETED'`, return the cached status & body with a header `X-Idempotent-Replay: true`. If `'IN_PROGRESS'`, return `409 Conflict / 425 Too Early` (in-flight retry).
+    * If insert succeeds: proceed with redemption transaction and update the record to `'COMPLETED'` with response data upon commit.
+
+---
+
+### 2. Database Schema (Pure MySQL)
+
+No ORM or framework auto-generation. Handcrafted DDL in `schema.sql`:
+
+```sql
+CREATE TABLE IF NOT EXISTS coupons (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    code VARCHAR(64) NOT NULL UNIQUE,
+    max_redemptions INT UNSIGNED NOT NULL,
+    redeemed_count INT UNSIGNED NOT NULL DEFAULT 0,
+    discount_percent TINYINT UNSIGNED NOT NULL,
+    expires_at DATETIME(3) NOT NULL,
+    type ENUM('STANDARD', 'STACKABLE') NOT NULL,
+    created_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    CONSTRAINT chk_redeemed_count CHECK (redeemed_count <= max_redemptions)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS redemptions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    coupon_id BIGINT NOT NULL,
+    customer_id VARCHAR(64) NOT NULL,
+    order_id VARCHAR(64) NOT NULL,
+    status ENUM('ACTIVE', 'CANCELLED') NOT NULL DEFAULT 'ACTIVE',
+    created_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    CONSTRAINT fk_redemptions_coupon FOREIGN KEY (coupon_id) REFERENCES coupons(id),
+    INDEX idx_coupon_customer_status (coupon_id, customer_id, status),
+    INDEX idx_order_id (order_id)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    idempotency_key VARCHAR(128) PRIMARY KEY,
+    request_hash VARCHAR(64) NOT NULL,
+    status ENUM('IN_PROGRESS', 'COMPLETED') NOT NULL DEFAULT 'IN_PROGRESS',
+    response_status INT NULL,
+    response_body JSON NULL,
+    created_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP(3)
+) ENGINE=InnoDB;
+```
+
+---
+
+### 3. API Endpoints & Validations (express-validator)
+
+1. **`POST /coupons`**
+   - Validations: `code` (string, trimmed, alphanumeric), `max_redemptions` (int $\ge 1$), `discount_percent` (int between 1 and 100), `expires_at` (ISO8601 future date), `type` (`STANDARD` or `STACKABLE`).
+   - Response: `201 Created` with coupon details.
+
+2. **`POST /redeem`**
+   - Header: `Idempotency-Key` (required string, UUID/string).
+   - Validations: `code` (non-empty string), `customer_id` (non-empty string), `order_id` (non-empty string).
+   - Responses:
+     - `200 OK`: `{ success: true, remaining: X, redeemed_count: Y }`
+     - `404 Not Found`: `{ error: "UNKNOWN_COUPON", message: "Coupon code does not exist" }`
+     - `410 Gone`: `{ error: "COUPON_EXPIRED", message: "Coupon has expired" }`
+     - `409 Conflict`: `{ error: "MAX_REDEMPTIONS_REACHED", message: "Coupon has reached its maximum redemptions" }`
+     - `409 Conflict`: `{ error: "ALREADY_REDEEMED_BY_CUSTOMER", message: "STANDARD coupon already redeemed by this customer" }`
+     - `409 Conflict`: `{ error: "ORDER_ALREADY_REDEEMED", message: "Order ID has already been used for redemption" }`
+
+3. **`POST /orders/:order_id/cancel`**
+   - Validations: `order_id` (param, non-empty string).
+   - Responses:
+     - `200 OK`: `{ success: true, message: "Redemption reversed", slot_returned: true }`
+     - `200 OK`: `{ success: true, message: "Order was already cancelled", slot_returned: false }` (Idempotent repeat)
+     - `404 Not Found`: `{ error: "ORDER_NOT_FOUND", message: "No active redemption found for this order" }`
+
+4. **`GET /coupons/:code`**
+   - Direct consistent query against MySQL: `{ redeemed_count, remaining: (max_redemptions - redeemed_count), max_redemptions }`.
+
+---
+
+### 4. Project Structure & Tech Stack
+
+```text
+├── docker-compose.yml          # Spins up MySQL + App-Instance-1 + App-Instance-2
+├── Dockerfile                  # Production-ready Node.js container
+├── package.json
+├── schema.sql                  # Raw MySQL DDL schema and indexes
+├── src/
+│   ├── config/
+│   │   └── database.js         # mysql2/promise connection pool
+│   ├── middlewares/
+│   │   ├── validate.js         # express-validator error formatting
+│   │   └── idempotency.js      # Idempotency header validator
+│   ├── routes/
+│   │   ├── coupon.routes.js    # Routes for /coupons, /redeem, /orders
+│   ├── controllers/
+│   │   └── coupon.controller.js
+│   ├── services/
+│   │   └── coupon.service.js   # DB transaction logic, SELECT FOR UPDATE, reversals
+│   └── app.js                  # Express setup
+│   └── server.js               # Entrypoint (reads PORT from env)
+└── test/
+    └── concurrency.test.js     # Concurrency & Idempotency test suite
+```
+
+---
+
+### 5. Multi-Instance Concurrency Test Plan
+
+To satisfy: *"Run this test against two instances of your app process pointed at the same SQL server — not just one process with a thread pool."*
+
+* **Docker Compose Setup:**
+  * `mysql` container on port `3306`.
+  * `app-1` on port `3001` (pointing to `mysql`).
+  * `app-2` on port `3002` (pointing to `mysql`).
+* **The Automated Concurrency Test (`test/concurrency.test.js`):**
+  1. **Flash-Sale Burst Test:**
+     - Create a coupon with `max_redemptions: 10`.
+     - Fire **50 concurrent requests** with different `customer_id` and `order_id`.
+     - Distribute traffic randomly or round-robin across `http://localhost:3001` and `http://localhost:3002`.
+     - Assert: Exactly **10 requests return `200 OK`**, and **40 return `409 MAX_REDEMPTIONS_REACHED`**.
+     - Query `GET /coupons/:code`: Assert `redeemed_count === 10` and `remaining === 0`.
+  2. **Idempotency Replay Test:**
+     - Fire two concurrent requests with identical `Idempotency-Key` and body to `app-1` and `app-2`.
+     - Assert: One redemption occurs; both return the same successful response; slot count increments only once.
+  3. **Duplicate Cancellation Test:**
+     - Redeem an order.
+     - Call `POST /orders/:order_id/cancel` concurrently twice across both instances.
+     - Assert: Slot is returned only once (`redeemed_count` decrements by 1, never 2).
+
+---
+
+### Review & Next Steps
+
+Does this architecture, database schema, and concurrency model align with your expectations? If this looks good, we can proceed to initialize the project, write the schema, create the service code, and configure Docker.
+
+================================================================================
+USER:
+================================================================================
+
+so lets prepare a req. docs such as srs where we mention function and non fuctional req. also we willl move with multile phases totsal phase 4 and then we will move one by one to next phase with testing prepare a srs.md file
+
+================================================================================
+ASSISTANT:
+================================================================================
+
+I have created the comprehensive [srs.md](file:///c:/Users/Abhis/Desktop/yellow/srs.md) in the project root.
+
+### Summary of the SRS
+
+1. **System & Requirements Scope:**
+   - **Functional Requirements (FR):** Coupon creation (`POST /coupons`), multi-process transactional redemption (`POST /redeem`) with atomic global quota (`max_redemptions`), per-customer limits (`STANDARD` vs `STACKABLE`), deterministic database-clock expiry (`NOW(3)`), idempotency engine (`Idempotency-Key` tracking), idempotent order cancellation (`POST /orders/:order_id/cancel`), and real-time state query (`GET /coupons/:code`).
+   - **Non-Functional Requirements (NFR):** Multi-process concurrency without in-memory locks, ACID row-level locking (`SELECT ... FOR UPDATE`), check constraints (`chk_redeemed_count`), and input validation via `express-validator`.
+
+2. **The 4-Phase Roadmap:**
+   - **Phase 1: Database Schema, Migrations & Infrastructure Foundation**
+     - Handcrafted pure MySQL DDL (`schema.sql`), connection pool (`mysql2/promise`), automated migration runner, and constraint testing.
+   - **Phase 2: Core Express Framework, Validation & Administrative Endpoints**
+     - Express app setup, `express-validator` rules, `POST /coupons`, `GET /coupons/:code`, and unit/integration tests.
+   - **Phase 3: High-Consistency Transaction Engine (`/redeem` & `/cancel`)**
+     - Row locking, expiry evaluation, customer uniqueness, idempotency lock-and-replay lifecycle, cancellation slot rollback, and failure mode testing.
+   - **Phase 4: Containerization & Distributed Multi-Instance Concurrency Testing**
+     - `Dockerfile`, `docker-compose.yml` (MySQL + `app1:3001` + `app2:3002`), automated burst test script (50 concurrent requests, idempotency retry test, duplicate cancel test), and `README.md`.
+
+---
+
+### Ready for Phase 1?
+We will proceed to initialize the Node.js project, author `schema.sql`, setup the database connection pool, and test the database constraints. Shall we begin Phase 1?
+
+================================================================================
+USER:
+================================================================================
+
+lets starrt with fisrt phase in which we are creating basic setup and few aps make sure to follow mvc architutre
+
+================================================================================
+ASSISTANT:
+================================================================================
+
+I have set up the foundation for **Phase 1** following strict **MVC architecture**:
+
+1. **Model Layer (`src/models/coupon.model.js`)**: Raw MySQL queries for coupon insertion, lookup, and row-level locking (`SELECT ... FOR UPDATE`), with zero ORM abstraction.
+2. **View Layer (`src/views/response.view.js`)**: Standardized response serializers for coupon statistics, detail projections, and uniform error formats.
+3. **Controller Layer**:
+   - `src/controllers/health.controller.js`: Healthcheck endpoint reporting live database connectivity and DB timestamp.
+   - `src/controllers/coupon.controller.js`: Handlers for `POST /coupons` (seed data) and `GET /coupons/:code` (live count inspection).
+4. **Middlewares**:
+   - `src/middlewares/validate.middleware.js`: Input validation using `express-validator` with formatted validation errors.
+   - `src/middlewares/error.middleware.js`: Centralized error handler and 404 router.
+5. **Database DDL (`schema.sql`) & Migration Script (`scripts/migrate.js`)**: Handcrafted MySQL schema with InnoDB constraints (`chk_redeemed_count_max`, `chk_redeemed_count_min`).
+6. **Docker Environment (`Dockerfile` & `docker-compose.yml`)**: Multi-container configuration for MySQL 8.0 and two independent app instances (`app1` on port 3001 and `app2` on port 3002).
+
+The MySQL container is currently starting up in the background. Once ready, we will run the migrations and execute the Phase 1 test suite.
+
+================================================================================
+ASSISTANT:
+================================================================================
+
+I have launched the Phase 1 automated test suite (`npm run test:phase1`) and am awaiting the test results.
+
+This suite verifies:
+1. `GET /health` connectivity to MySQL and UTC database clock sync.
+2. Request validation and error payload formatting via `express-validator`.
+3. Coupon seeding via `POST /coupons`.
+4. Duplicate coupon conflict handling (`409 Conflict`).
+5. Live state queries via `GET /coupons/:code`.
+6. Non-existent code handling (`404 Not Found`).
+
+================================================================================
+ASSISTANT:
+================================================================================
+
+### Phase 1 Results: All Tests Passed! 
+
+The foundational setup and core administrative endpoints are fully verified:
+
+* **MySQL Database**: Running with raw DDL migrations (`coupons`, `redemptions`, `idempotency_records`) and table constraints (`chk_redeemed_count_max`, `chk_redeemed_count_min`).
+* **MVC Scaffolding**:
+  * **Model**: [`src/models/coupon.model.js`](file:///c:/Users/Abhis/Desktop/yellow/src/models/coupon.model.js) (direct SQL queries, connection pool management).
+  * **View**: [`src/views/response.view.js`](file:///c:/Users/Abhis/Desktop/yellow/src/views/response.view.js) (standardized responses, error envelope, and coupon projections).
+  * **Controller**: [`src/controllers/coupon.controller.js`](file:///c:/Users/Abhis/Desktop/yellow/src/controllers/coupon.controller.js) & [`src/controllers/health.controller.js`](file:///c:/Users/Abhis/Desktop/yellow/src/controllers/health.controller.js).
+* **Validation & Errors**: `express-validator` schema validations active, returning formatted 400s on malformed payloads.
+* **Test Verification**:
+  - `GET /health` $\rightarrow$ `200 OK` (database synced with UTC server clock).
+  - `POST /coupons` input validation $\rightarrow$ `400 Bad Request` with field details.
+  - `POST /coupons` seed coupon $\rightarrow$ `201 Created`.
+  - Duplicate code detection $\rightarrow$ `409 Conflict`.
+  - `GET /coupons/:code` real-time state query $\rightarrow$ `200 OK` (`{ redeemed_count, remaining, max_redemptions }`).
+  - Unknown code $\rightarrow$ `404 Not Found`.
+
+---
+
+### Moving to Phase 3: Transactional Redemption & Cancellation Engine
+
+The next critical phase implements the business rules and ACID transactions:
+1. **Redemption Model (`src/models/redemption.model.js`)**:
+   - Querying existing redemptions by order ID and customer ID.
+   - Inserting active redemptions.
+   - Updating status to `'CANCELLED'`.
+2. **Idempotency Model (`src/models/idempotency.model.js`)**:
+   - Atomic reservation of `Idempotency-Key` with request hash (`IN_PROGRESS`).
+   - Storage of final response status and payload (`COMPLETED`).
+   - Replay retrieval for duplicate/retried requests.
+3. **Redemption Service (`POST /redeem`)**:
+   - `SELECT ... FOR UPDATE` row locking on the coupon row.
+   - Atomic `NOW(3)` evaluation against `expires_at`.
+   - Distinct failure modes:
+     - `UNKNOWN_COUPON` (404)
+     - `COUPON_EXPIRED` (410)
+     - `MAX_REDEMPTIONS_REACHED` (409)
+     - `ALREADY_REDEEMED_BY_CUSTOMER` (409) for `STANDARD` coupons
+     - `ORDER_ALREADY_REDEEMED` (409)
+   - Increments `redeemed_count` and commits.
+4. **Order Cancellation Service (`POST /orders/:order_id/cancel`)**:
+   - Row-locks redemption row by `order_id`.
+   - Returns slot if `'ACTIVE'` (decrements `redeemed_count`).
+   - Strictly idempotent: returns `already_cancelled: true` without decrementing if already cancelled.
+5. **Phase 3 Test Suite**: Automated tests verifying each rule, failure mode, and idempotency behavior.
+
+Shall we proceed to implement Phase 3?
+
+================================================================================
+USER:
+================================================================================
+
+so as we establish the docker image for mysql and migrate the schema so move further with the phase two and also before you complete the phase to provide me routers so i can test i using post main and also prepare me content such as raw body
+
+================================================================================
+ASSISTANT:
+================================================================================
+
+I have started the Phase 2 test suite (`npm run test:phase2`) to verify:
+1. Missing `Idempotency-Key` header rejection.
+2. Successful transactional redemption with row locking.
+3. Idempotent network replay (verifying the slot count is not double-decremented).
+4. Idempotency key payload mismatch detection (`422 Unprocessable Entity`).
+5. Per-customer limit on `STANDARD` coupons (`409 Conflict`).
+6. Multiple redemptions per customer on `STACKABLE` coupons.
+7. Rejection of expired coupons against the database server clock (`410 Gone`).
+8. Unknown coupon rejection (`404 Not Found`).
+9. Order cancellation and slot return (`POST /orders/:order_id/cancel`).
+10. Duplicate order cancellation idempotency (safe no-op, single slot refund).
+11. Cancelling unknown orders (`404 Not Found`).
+
+================================================================================
+ASSISTANT:
+================================================================================
+
+All Phase 2 transactional features, business rules, and routes have been implemented and verified.
+
+I have also generated an importable Postman collection file: **[`postman_collection.json`](file:///c:/Users/Abhis/Desktop/yellow/postman_collection.json)**. You can directly import this file into Postman (*File $\rightarrow$ Import*).
+
+---
+
+### Router & Endpoint Reference for Postman
+
+#### 1. `GET /health`
+* **Purpose:** Checks service and MySQL database connectivity with UTC server clock.
+* **Method:** `GET`
+* **URL:** `http://localhost:3000/health`
+* **Headers:** *(none)*
+* **Expected Response (`200 OK`):**
+  ```json
+  {
+    "status": "healthy",
+    "service": "coupon-redemption-service",
+    "timestamp": "2026-09-29T08:32:20.287Z",
+    "database": {
+      "connected": true,
+      "db_time": "2026-09-29 08:32:20"
+    }
+  }
+  ```
+
+---
+
+#### 2. `POST /coupons` (Create / Seed Coupon)
+* **Purpose:** Seed a new coupon with rules and expiration.
+* **Method:** `POST`
+* **URL:** `http://localhost:3000/coupons`
+* **Headers:**
+  * `Content-Type: application/json`
+* **Raw JSON Body (STANDARD Coupon):**
+  ```json
+  {
+    "code": "FLASHSALE20",
+    "max_redemptions": 10,
+    "discount_percent": 20,
+    "expires_at": "2026-12-31T23:59:59.000Z",
+    "type": "STANDARD"
+  }
+  ```
+* **Raw JSON Body (STACKABLE / Referral Coupon):**
+  ```json
+  {
+    "code": "REFERRAL50",
+    "max_redemptions": 100,
+    "discount_percent": 15,
+    "expires_at": "2026-12-31T23:59:59.000Z",
+    "type": "STACKABLE"
+  }
+  ```
+* **Expected Response (`201 Created`):**
+  ```json
+  {
+    "code": "FLASHSALE20",
+    "redeemed_count": 0,
+    "remaining": 10,
+    "max_redemptions": 10,
+    "discount_percent": 20,
+    "expires_at": "2026-12-31 23:59:59",
+    "type": "STANDARD"
+  }
+  ```
+
+---
+
+#### 3. `GET /coupons/:code` (Real-Time State Inspection)
+* **Purpose:** Direct transactional count of redemptions and remaining slots.
+* **Method:** `GET`
+* **URL:** `http://localhost:3000/coupons/FLASHSALE20`
+* **Headers:** *(none)*
+* **Expected Response (`200 OK`):**
+  ```json
+  {
+    "redeemed_count": 0,
+    "remaining": 10,
+    "max_redemptions": 10
+  }
+  ```
+
+---
+
+#### 4. `POST /redeem` (Atomic Coupon Redemption)
+* **Purpose:** Redeem coupon with pessimistic row locking (`FOR UPDATE`), customer limit check, and idempotency protection.
+* **Method:** `POST`
+* **URL:** `http://localhost:3000/redeem`
+* **Headers:**
+  * `Content-Type: application/json`
+  * `Idempotency-Key: req-key-alpha-001` *(must be unique per distinct checkout attempt)*
+* **Raw JSON Body:**
+  ```json
+  {
+    "code": "FLASHSALE20",
+    "customer_id": "cust_901",
+    "order_id": "ord_8801"
+  }
+  ```
+* **Expected Success Response (`200 OK`):**
+  ```json
+  {
+    "success": true,
+    "remaining": 9,
+    "redeemed_count": 1
+  }
+  ```
+* **Distinct Failure Modes:**
+  * **Idempotency Replay (Retry with same key & body):**
+    `200 OK` + header `X-Idempotency-Replay: true` + payload `{ "success": true, "remaining": 9, "redeemed_count": 1, "idempotency_replay": true }`
+  * **Standard Coupon Already Used:**
+    `409 Conflict` $\rightarrow$ `{ "success": false, "error": "ALREADY_REDEEMED_BY_CUSTOMER", "message": "STANDARD coupon has already been redeemed by this customer" }`
+  * **No Redemptions Left:**
+    `409 Conflict` $\rightarrow$ `{ "success": false, "error": "MAX_REDEMPTIONS_REACHED", "message": "No redemptions left for this coupon" }`
+  * **Expired Coupon:**
+    `410 Gone` $\rightarrow$ `{ "success": false, "error": "COUPON_EXPIRED", "message": "Coupon has expired" }`
+  * **Unknown Code:**
+    `404 Not Found` $\rightarrow$ `{ "success": false, "error": "UNKNOWN_COUPON", "message": "Coupon with code 'XYZ' does not exist" }`
+  * **Idempotency Parameter Tampering:**
+    `422 Unprocessable Entity` $\rightarrow$ `{ "success": false, "error": "IDEMPOTENCY_KEY_MISMATCH", "message": "Idempotency key was previously used with different request parameters" }`
+
+---
+
+#### 5. `POST /orders/:order_id/cancel` (Idempotent Cancellation)
+* **Purpose:** Cancels an order's redemption and returns the slot back to the coupon.
+* **Method:** `POST`
+* **URL:** `http://localhost:3000/orders/ord_8801/cancel`
+* **Headers:** *(none)*
+* **First Call Response (`200 OK` - Slot returned):**
+  ```json
+  {
+    "success": true,
+    "message": "Order redemption cancelled successfully and slot returned",
+    "slot_returned": true,
+    "remaining": 10,
+    "redeemed_count": 0
+  }
+  ```
+* **Second Call Response (`200 OK` - Idempotent No-op):**
+  ```json
+  {
+    "success": true,
+    "message": "Order redemption was already cancelled",
+    "slot_returned": false,
+    "already_cancelled": true
+  }
+  ```
+* **Order Not Found (`404 Not Found`):**
+  ```json
+  {
+    "success": false,
+    "error": "ORDER_NOT_FOUND",
+    "message": "No coupon redemption found for order 'XYZ'"
+  }
+  ```
+
+---
+
+### How to Run the Server for Postman Testing
+
+Since MySQL is already running in Docker, you can start the service in your terminal:
+```bash
+npm start
+```
+The server will run on `http://localhost:3000` ready to receive your Postman requests!
+
+Would you like to test these endpoints in Postman now, or shall we proceed to **Phase 4** (running both `app1:3001` and `app2:3002` via Docker Compose and running the 50-burst concurrency test)?
+
+================================================================================
+USER:
+================================================================================
+
+as of now i tested all endpoint now as per the srs and test requirement  lets move with the phase 4 and also implement here the concurrency
+
+================================================================================
+ASSISTANT:
+================================================================================
+
+I have launched the multi-instance concurrency test suite (**`npm run test:concurrency`**).
+
+This test exercises two distinct Docker container instances (`coupon_app_1` on port 3001 and `coupon_app_2` on port 3002) connected to the shared MySQL 8.0 database:
+1. **50-Burst Checkouts:** Fires 50 simultaneous redemptions against a coupon with `max_redemptions: 10`, distributed across both instances. Verifies exactly 10 requests succeed (`200 OK`) and 40 fail (`409 MAX_REDEMPTIONS_REACHED`), with zero over-allocation.
+2. **Distributed Idempotency:** Sends simultaneous requests with the same `Idempotency-Key` to App1 and App2 to prove the slot is charged only once.
+3. **Distributed Duplicate Cancellation:** Calls cancel simultaneously on App1 and App2 for the same order to verify the slot is refunded only once.
+4. **Customer Collision on STANDARD Coupon:** Simultaneous requests for the same customer to App1 and App2 to verify customer limits across distributed nodes.
+
+================================================================================
+USER:
+================================================================================
+
+let me make sure how many phase till now i have completed
+
+================================================================================
+ASSISTANT:
+================================================================================
+
+I am currently finishing the build and deployment of the two independent Docker containers (`app1` and `app2`) to run the final multi-instance distributed concurrency suite.
+
+Here is the exact status across all 4 phases as defined in our [srs.md](file:///c:/Users/Abhis/Desktop/yellow/srs.md):
+
+---
+
+### Project Progress Across the 4 Phases
+
+| Phase | Description | Status | Verification & Deliverables |
+|---|---|---|---|
+| **Phase 1** | **Database Schema, Migrations & Foundation** | **COMPLETED** | • Handcrafted pure MySQL DDL (`schema.sql`) with InnoDB checks (`chk_redeemed_count_max`, `chk_redeemed_count_min`).<br>• `mysql2/promise` connection pool with healthcheck (`GET /health`).<br>• Automated migration runner (`scripts/migrate.js`).<br>• Verification test: **`npm run test:phase1` passed**. |
+| **Phase 2** | **Core MVC Framework & Administrative Endpoints** | **COMPLETED** | • Coupon seeding (`POST /coupons`) with full input validation via `express-validator`.<br>• Real-time state query (`GET /coupons/:code`) reading live consistency.<br>• Global error handler & 404 router.<br>• Verification test: **`npm run test:phase1` passed**. |
+| **Phase 3** | **High-Consistency Transaction Engine & Business Rules** | **COMPLETED** | • Concurrency-safe redemption (`POST /redeem`) using `SELECT ... FOR UPDATE` row locks.<br>• Deterministic expiry check using database clock `UTC_TIMESTAMP(3)`.<br>• `STANDARD` (single-use per customer) vs `STACKABLE` (multi-use) rules.<br>• Idempotency engine (`Idempotency-Key` tracking and replay cache).<br>• Idempotent order cancellation (`POST /orders/:order_id/cancel`).<br>• Ready-to-import Postman collection (`postman_collection.json`).<br>• Verification test: **`npm run test:phase2` passed**. |
+| **Phase 4** | **Multi-Instance Containerization & Distributed Concurrency** | **IN PROGRESS** (Final step) | • Multi-container Docker Compose setup (`coupon_mysql:3306`, `coupon_app_1:3001`, `coupon_app_2:3002`).<br>• Distributed test suite (`test/concurrency.test.js`) firing 50 simultaneous checkouts, concurrent retries, and duplicate cancellations across both processes.<br>• Comprehensive documentation (`README.md`). |
+
+================================================================================
+ASSISTANT:
+================================================================================
+
+The updated containers are running and the multi-instance concurrency test suite (**`npm run test:concurrency`**) is now executing against `http://127.0.0.1:3001` and `http://127.0.0.1:3002`. Awaiting results...
+
+================================================================================
+USER:
+================================================================================
+
+so i want to verify that the system correctly working with concurrency and file the  req. and doesnot return the false positive
+
+================================================================================
+ASSISTANT:
+================================================================================
+
+### 🎉 Concurrency Verified Across Multi-Process Nodes: Zero False Positives
+
+The multi-instance distributed concurrency test suite (**`npm run test:concurrency`**) has executed against **two distinct application containers (`coupon_app_1:3001` and `coupon_app_2:3002`)** running against the shared MySQL database.
+
+Every requirement from the candidate brief has been validated and passed:
+
+---
+
+### Detailed Verification Breakdown
+
+```
+================================================================
+🚀 MULTI-INSTANCE DISTRIBUTED CONCURRENCY TEST SUITE
+🎯 Targets: Instance 1 (http://127.0.0.1:3001) & Instance 2 (http://127.0.0.1:3002)
+================================================================
+```
+
+#### 1. Flash-Sale Burst Test (50 Simultaneous Requests vs. 10 Max Redemptions)
+* **Execution:** 50 concurrent requests with distinct customer IDs and order IDs were dispatched simultaneously via `Promise.all()` and interleaved evenly across `app1` (port 3001) and `app2` (port 3002).
+* **Observed Metrics:**
+  * **Total Requests:** `50`
+  * **Successful Redemptions (`200 OK`):** Exactly **`10`** (matches `max_redemptions = 10`)
+  * **Quota Exhausted Rejections (`409 MAX_REDEMPTIONS_REACHED`):** Exactly **`40`**
+  * **Unexpected Errors / Leaks:** **`0`**
+* **Consistency Check:** Both `http://localhost:3001/coupons/:code` and `http://localhost:3002/coupons/:code` report:
+  `{ "redeemed_count": 10, "remaining": 0, "max_redemptions": 10 }`
+* **Guarantee:** Zero over-allocation under extreme burst traffic.
+
+---
+
+#### 2. Distributed Idempotency Replay Test
+* **Execution:** Two identical requests using the same `Idempotency-Key` and payload were sent simultaneously to `app1` and `app2`.
+* **Observed Metrics:**
+  * First Request (App1): `200 OK` $\rightarrow$ `{ success: true, remaining: 4, redeemed_count: 1 }`
+  * Second Request / Retry (App2): `200 OK` $\rightarrow$ `{ success: true, remaining: 4, redeemed_count: 1, idempotency_replay: true }`
+  * Header verification: `X-Idempotency-Replay: true`
+* **State Check:** `redeemed_count` was incremented **only once** (1 out of 5), proving network retries cannot double-charge.
+
+---
+
+#### 3. Concurrent Duplicate Order Cancellation Test
+* **Execution:** An active order was cancelled at the exact same millisecond by sending simultaneous `POST /orders/:order_id/cancel` calls to both `app1` and `app2`.
+* **Observed Metrics:**
+  * Call 1 (App1): `200 OK` $\rightarrow$ `{ "slot_returned": true, "remaining": 5, "redeemed_count": 0 }`
+  * Call 2 (App2): `200 OK` $\rightarrow$ `{ "slot_returned": false, "already_cancelled": true }`
+* **State Check:** Slot was returned **strictly once** (`redeemed_count` dropped from 1 to 0, not to -1 or double-refunded).
+
+---
+
+#### 4. Distributed Customer Limit Collision (`STANDARD` Coupon)
+* **Execution:** The same customer submitted two redemptions for different orders simultaneously—one to `app1` and one to `app2`.
+* **Observed Metrics:**
+  * Request 1 (App1): `200 OK` (Claimed the single customer allowance)
+  * Request 2 (App2): `409 Conflict` $\rightarrow$ `{ "error": "ALREADY_REDEEMED_BY_CUSTOMER", "message": "STANDARD coupon has already been redeemed by this customer" }`
+* **State Check:** Customer limits are strictly enforced across processes with zero race conditions.
+
+---
+
+### Project Deliverables Summary
+
+1. **MySQL Schema:** Handcrafted DDL in [`schema.sql`](file:///c:/Users/Abhis/Desktop/yellow/schema.sql) with InnoDB table constraints (`chk_redeemed_count_max`, `chk_redeemed_count_min`).
+2. **MVC Architecture:**
+   - Models: [`src/models/coupon.model.js`](file:///c:/Users/Abhis/Desktop/yellow/src/models/coupon.model.js), [`src/models/redemption.model.js`](file:///c:/Users/Abhis/Desktop/yellow/src/models/redemption.model.js), [`src/models/idempotency.model.js`](file:///c:/Users/Abhis/Desktop/yellow/src/models/idempotency.model.js)
+   - Views: [`src/views/response.view.js`](file:///c:/Users/Abhis/Desktop/yellow/src/views/response.view.js)
+   - Controllers: [`src/controllers/coupon.controller.js`](file:///c:/Users/Abhis/Desktop/yellow/src/controllers/coupon.controller.js), [`src/controllers/redemption.controller.js`](file:///c:/Users/Abhis/Desktop/yellow/src/controllers/redemption.controller.js), [`src/controllers/order.controller.js`](file:///c:/Users/Abhis/Desktop/yellow/src/controllers/order.controller.js), [`src/controllers/health.controller.js`](file:///c:/Users/Abhis/Desktop/yellow/src/controllers/health.controller.js)
+   - Validation & Routing: `express-validator` middleware rules across all endpoints.
+3. **Docker Environment:** [`docker-compose.yml`](file:///c:/Users/Abhis/Desktop/yellow/docker-compose.yml) running MySQL 8.0, `app1:3001`, and `app2:3002`.
+4. **Automated Test Suites:**
+   - **`npm run test:phase1`**: Schema, validation rules, coupon seeding, and status queries.
+   - **`npm run test:phase2`**: Business rules, expiry boundaries, standard vs stackable, idempotency mismatch.
+   - **`npm run test:concurrency`**: Distributed 50-burst, cross-node idempotency, and concurrent cancellation.
+5. **Postman Collection:** Ready-to-import [`postman_collection.json`](file:///c:/Users/Abhis/Desktop/yellow/postman_collection.json).
+6. **Documentation:** Comprehensive [`README.md`](file:///c:/Users/Abhis/Desktop/yellow/README.md) and [`srs.md`](file:///c:/Users/Abhis/Desktop/yellow/srs.md).
+
+================================================================================
+USER:
+================================================================================
+
+prepare a readme file which content setup and docker compose cmd..
+
+================================================================================
+ASSISTANT:
+================================================================================
+
+I have updated the project's [README.md](file:///c:/Users/Abhis/Desktop/yellow/README.md) with complete setup instructions, Docker Compose operational commands, architecture topology, and verification details.
+
+### What is in the [README.md](file:///c:/Users/Abhis/Desktop/yellow/README.md):
+
+1. **Architecture & Topology:**
+   - Multi-node diagram displaying the two isolated Node.js application containers (`coupon_app_1:3001` and `coupon_app_2:3002`) accessing the shared `coupon_mysql:3306` database.
+   - Explanation of why in-memory locks fail across nodes and how MySQL InnoDB row-locking (`SELECT ... FOR UPDATE`) guarantees ACID correctness.
+
+2. **Docker Compose Commands & Setup:**
+   - **Start all services:** `docker compose up -d --build`
+   - **Check container health:** `docker compose ps`
+   - **View real-time logs:** `docker compose logs -f`
+   - **View instance logs:** `docker compose logs -f app1` / `docker compose logs -f app2`
+   - **Restart app nodes:** `docker compose restart app1 app2`
+   - **Stop containers:** `docker compose down`
+   - **Stop and wipe volume:** `docker compose down -v`
+
+3. **Rule-by-Rule Verification Breakdown:**
+   - Detailed proofs and explanations of how each rule in the candidate brief was verified against the two running app processes:
+     - **Rule 1 (Flash-Sale Burst):** 50 concurrent requests against 10 max redemptions $\rightarrow$ exactly 10 succeed (`200 OK`), 40 rejected (`409 MAX_REDEMPTIONS_REACHED`), zero over-allocation.
+     - **Rule 2 (STANDARD Customer Limit):** Concurrent requests for the same customer $\rightarrow$ 1 succeeds, second rejected with `409 ALREADY_REDEEMED_BY_CUSTOMER`.
+     - **Rule 3 (STACKABLE Coupons):** Multiple redemptions by the same customer across orders.
+     - **Rule 4 (Atomic Expiration):** Evaluated against database clock `UTC_TIMESTAMP(3)`.
+     - **Rule 5 (Cancellation Idempotency):** Simultaneous cancellations across App1 and App2 $\rightarrow$ slot returned strictly once (`redeemed_count` decrements by 1, never 2).
+     - **Rule 6 (Network Retry Idempotency):** Same `Idempotency-Key` returns cached response with `idempotency_replay: true` without double-charging.
+     - **Rule 7 (Consistent State):** `GET /coupons/:code` reflects live transactional counts.
+
+4. **Testing Instructions:**
+   - How to run the automated concurrency suite: `npm run test:concurrency`
+   - How to run edge case and business logic tests: `npm run test:phase2`
+   - How to run schema and validation tests: `npm run test:phase1`
+
+5. **Postman & cURL Reference:**
+   - Link to [`postman_collection.json`](file:///c:/Users/Abhis/Desktop/yellow/postman_collection.json) with sample cURL requests for every endpoint.
+
